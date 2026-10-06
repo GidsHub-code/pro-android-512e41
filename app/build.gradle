@@ -19,7 +19,7 @@ android {
         minSdk 23
         targetSdk 36
         versionCode 7
-        versionName "2.7"
+        versionName "2.8"
 
         manifestPlaceholders = [
             hostName: "ofix2.ofixplan.workers.dev",
