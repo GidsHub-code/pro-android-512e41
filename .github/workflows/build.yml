@@ -1,0 +1,146 @@
+name: Build Android App
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: Checkout project
+        uses: actions/checkout@v4
+
+      - name: Set up Java 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@v3
+        with:
+          packages: 'platform-tools'
+
+      - name: Install required SDK packages
+        run: sdkmanager "platform-tools" "platforms;android-35" "build-tools;35.0.0"
+
+      - name: Prepare Gradle
+        run: |
+          chmod +x gradlew
+          ./gradlew --version
+
+      - name: Write google-services.json (enables Firebase Cloud Messaging)
+        env:
+          GOOGLE_SERVICES_JSON: ${{ secrets.GOOGLE_SERVICES_JSON }}
+        run: |
+          if [ -z "$GOOGLE_SERVICES_JSON" ]; then
+            echo "GOOGLE_SERVICES_JSON secret not set — FCM push will be disabled in this build."
+            echo "Add it (raw JSON or base64) in repo Settings → Secrets and variables → Actions to enable push."
+            exit 0
+          fi
+          # Accept either raw JSON or base64-encoded JSON
+          if printf '%s' "$GOOGLE_SERVICES_JSON" | head -c 1 | grep -q '{'; then
+            printf '%s' "$GOOGLE_SERVICES_JSON" > app/google-services.json
+          else
+            printf '%s' "$GOOGLE_SERVICES_JSON" | base64 --decode > app/google-services.json
+          fi
+          echo "google-services.json written ($(wc -c < app/google-services.json) bytes) — Firebase plugin will activate."
+
+      - name: Check FCM server key (FCM_SERVICE_ACCOUNT_JSON) — optional, never bundled into the app
+        continue-on-error: true
+        env:
+          FCM_SERVICE_ACCOUNT_JSON: ${{ secrets.FCM_SERVICE_ACCOUNT_JSON }}
+        run: |
+          # SECURITY: FCM_SERVICE_ACCOUNT_JSON is a Google service-account PRIVATE key.
+          # It is used by your *backend* to SEND pushes via the FCM HTTP v1 API.
+          # It is NOT needed to build the app and is NEVER embedded in the APK/AAB.
+          # This step only gives a friendly check; it can never fail the build.
+          python3 <<'PY' || true
+          import base64, json, os
+          raw = os.environ.get("FCM_SERVICE_ACCOUNT_JSON", "")
+          if not raw.strip():
+              print("FCM_SERVICE_ACCOUNT_JSON not set — fine, the app build does not need it.")
+              raise SystemExit(0)
+
+          def candidates(value):
+              v = value.strip().lstrip(chr(0xFEFF)).strip()
+              yield v
+              # Wrapped in quotes (e.g. pasted as a JSON string)
+              if len(v) > 1 and v[0] == v[-1] and v[0] in ("'", '"'):
+                  yield v[1:-1]
+              # Base64 (standard or URL-safe, with or without padding/line breaks)
+              compact = "".join(v.split())
+              pad = "=" * (-len(compact) % 4)
+              for decoder in (base64.b64decode, base64.urlsafe_b64decode):
+                  try:
+                      yield decoder(compact + pad).decode("utf-8-sig")
+                  except Exception:
+                      pass
+
+          sa = None
+          for c in candidates(raw):
+              try:
+                  parsed = json.loads(c)
+                  # Double-encoded JSON string
+                  if isinstance(parsed, str):
+                      parsed = json.loads(parsed)
+                  if isinstance(parsed, dict):
+                      sa = parsed
+                      break
+              except Exception:
+                  continue
+
+          if sa is None:
+              print("::warning::FCM_SERVICE_ACCOUNT_JSON could not be read as JSON or base64. "
+                    "This does NOT affect the app build. If you need it, paste the full "
+                    "service-account .json file contents (from Firebase > Project settings > "
+                    "Service accounts > Generate new private key) into your backend, not the app.")
+              raise SystemExit(0)
+
+          if "project_info" in sa and "client" in sa:
+              print("::warning::FCM_SERVICE_ACCOUNT_JSON looks like google-services.json. "
+                    "That file belongs in the GOOGLE_SERVICES_JSON secret instead. Build continues.")
+              raise SystemExit(0)
+
+          required = ["type", "project_id", "private_key", "client_email", "token_uri"]
+          missing = [k for k in required if k not in sa]
+          if missing or sa.get("type") != "service_account":
+              print("::warning::FCM_SERVICE_ACCOUNT_JSON is not a complete service-account key "
+                    "(missing: " + ", ".join(missing or ["type=service_account"]) + "). Build continues.")
+              raise SystemExit(0)
+
+          print("FCM service account OK — project_id=" + str(sa.get("project_id")))
+          print("Validated only. Key was NOT bundled into the APK/AAB.")
+          PY
+          echo "FCM key check finished — continuing with the app build."
+
+      - name: Build signed release APK and AAB
+        env:
+          KEYSTORE_BASE64: ${{ secrets.KEYSTORE_BASE64 }}
+          KEYSTORE_PASSWORD: ${{ secrets.KEYSTORE_PASSWORD }}
+          KEY_ALIAS: ${{ secrets.KEY_ALIAS }}
+          KEY_PASSWORD: ${{ secrets.KEY_PASSWORD }}
+        run: |
+          if [ -z "$KEYSTORE_BASE64" ] || [ -z "$KEYSTORE_PASSWORD" ] || [ -z "$KEY_ALIAS" ] || [ -z "$KEY_PASSWORD" ]; then
+            echo "::error::Release signing secrets are missing. Add KEYSTORE_BASE64, KEYSTORE_PASSWORD, KEY_ALIAS, and KEY_PASSWORD in repo Settings → Secrets and variables → Actions."
+            exit 1
+          fi
+          printf '%s' "$KEYSTORE_BASE64" | base64 --decode > "$RUNNER_TEMP/git2app-release.jks"
+          export KEYSTORE_PATH="$RUNNER_TEMP/git2app-release.jks"
+          ./gradlew --no-daemon assembleRelease bundleRelease --stacktrace
+
+      - name: Upload signed release APK and AAB
+        uses: actions/upload-artifact@v4
+        with:
+          name: signed-release-apk-aab
+          path: |
+            app/build/outputs/apk/release/*.apk
+            app/build/outputs/bundle/release/*.aab
+          if-no-files-found: error
