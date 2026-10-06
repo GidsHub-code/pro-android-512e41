@@ -12,12 +12,12 @@ def hasReleaseSigning = System.getenv("KEYSTORE_PATH") && System.getenv("KEYSTOR
 
 android {
     namespace "ofix.pro"
-    compileSdk 35
+    compileSdk 36
 
     defaultConfig {
         applicationId "ofix.pro"
         minSdk 23
-        targetSdk 35
+        targetSdk 36
         versionCode 7
         versionName "2.7"
 
